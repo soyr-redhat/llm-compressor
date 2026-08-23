@@ -1,9 +1,17 @@
+import json
 import os
 import shutil
 from pathlib import Path
 from typing import Iterable, Optional
 
 import torch
+from compressed_tensors import __version__ as ct_version
+from compressed_tensors.base import (
+    COMPRESSION_VERSION_NAME,
+    QUANTIZATION_CONFIG_NAME,
+    QUANTIZATION_METHOD_NAME,
+    TRANSFORM_CONFIG_NAME,
+)
 from compressed_tensors.entrypoints.convert import (
     Converter,
     build_inverse_weight_maps,
@@ -11,25 +19,18 @@ from compressed_tensors.entrypoints.convert import (
 )
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.utils.safetensors_load import (
+    InverseWeightMap,
+    find_config_path,
     get_checkpoint_files,
     get_weight_map,
     is_weights_file,
+    load_tensors_from_inverse_weight_map,
     update_safetensors_index,
 )
 from loguru import logger
+from safetensors.torch import save_file
 
-from llmcompressor.entrypoints.model_free.microscale import (
-    build_microscale_inverse_weight_maps,
-    is_microscale_scheme,
-)
-from llmcompressor.entrypoints.model_free.process import (
-    process_file,
-    process_file_microscale_scheme,
-    validate_file,
-)
-from llmcompressor.entrypoints.model_free.save_utils import (
-    update_config,
-)
+from llmcompressor.entrypoints.model_free.process import ModelFreePtqConverter
 from llmcompressor.entrypoints.model_free.validate import (
     validate_safetensors_index,
     validate_scheme,
@@ -65,10 +66,9 @@ def model_free_ptq(
         automatically ignored
     :param max_workers: number of worker threads to process files with
     :param device: gpu devices to accelerate quantization with.
-    :param converter: optional converter to apply to the checkpoint to convert
-        it to compressed-tensors format before running model-free PTQ
+    :param converter: optional converter to apply to the checkpoint before
+        running model-free PTQ, e.g. an AWQ or fp8 dequantizer
     """
-    # validate arguments
     model_files = get_checkpoint_files(model_stub)
 
     scheme_name, scheme = validate_scheme(scheme)
@@ -85,13 +85,14 @@ def model_free_ptq(
             logger.info(f"Copying {file_path} -> {save_path}")
             shutil.copyfile(resolved_path, save_path)
 
+    mfptq = ModelFreePtqConverter(scheme, scheme_name, ignore)
+    converters = ([converter] if converter is not None else []) + [mfptq]
+
     # build quantization jobs
-    jobs = _build_jobs(
-        model_files, save_directory, scheme, ignore, resolved_devices, converter
-    )
+    jobs = _build_jobs(model_files, save_directory, converters, resolved_devices)
 
     # 1. validate quantizable tensors — fail fast before long-running quantization
-    validate_jobs = [(validate_file, *job[1:]) for job in jobs]
+    validate_jobs = [(_validate_shard, *job[1:]) for job in jobs]
     exec_jobs(validate_jobs, max_workers, desc="Validating")
 
     # 2-5. quantize and compress weights
@@ -103,9 +104,7 @@ def model_free_ptq(
         weight_map.update(_weight_map)
 
     # 6. update config and safetensors index
-    # weight_map may contain tensors re-located to new shards (partner tensors
-    # re-saved alongside the shard that needed them for fused scale computation)
-    update_config(save_directory, scheme_name, scheme, ignore, converter)
+    _write_quant_config(save_directory, converters)
     update_safetensors_index(save_directory, total_size, weight_map)
 
 
@@ -136,36 +135,24 @@ def _resolve_devices(
 def _build_jobs(
     model_files: dict[str, str],
     save_directory: str | os.PathLike,
-    scheme: QuantizationScheme,
-    ignore: Iterable[str],
+    converters: list[Converter],
     devices: list[torch.device],
-    converter: Converter | None,
 ) -> list[tuple]:
     """
-    Build jobs with precomputed inverse_weight_map per shard.
+    Build quantization jobs with precomputed inverse_weight_map per shard.
 
-    For each output shard, build_inverse_weight_map() determines exactly which
-    tensors to load from which source files — including any fused partner tensors
-    from other shards. This avoids runtime fused-partner discovery inside the
-    process function and eliminates redundant tensor reads.
+    The converter chain's get_dependencies() results drive build_inverse_weight_maps,
+    so microscale partner tensors are pulled in automatically without special-casing.
 
-    :returns: list of jobs tuples
-        (job_fn, inverse_weight_map, save_path, scheme, ignore, device, converter)
+    :returns: list of job tuples
+        (_process_shard, inverse_weight_map, save_path, converters, device)
         Shards are distributed round-robin across the given devices.
     """
     weight_map = get_weight_map(model_files)
-
-    if is_microscale_scheme(scheme):
-        job_fn = process_file_microscale_scheme
-        build_inverse_weight_maps_fn = build_microscale_inverse_weight_maps
-    else:
-        job_fn = process_file
-        build_inverse_weight_maps_fn = build_inverse_weight_maps
-
-    inverse_weight_maps = build_inverse_weight_maps_fn(
+    inverse_weight_maps = build_inverse_weight_maps(
         weight_map=weight_map,
         model_files=model_files,
-        converters=[converter] if converter is not None else [],
+        converters=converters,
     )
 
     shard_names = [name for name in model_files if name.endswith("safetensors")]
@@ -184,17 +171,78 @@ def _build_jobs(
             )
 
         device = devices[i % len(devices)]
-
         jobs.append(
             (
-                job_fn,
+                _process_shard,
                 inverse_weight_maps[shard_name],
                 save_path,
-                scheme,
-                ignore,
+                converters,
                 device,
-                converter,
             )
         )
 
     return jobs
+
+
+def _process_shard(
+    inverse_weight_map: InverseWeightMap,
+    save_path: str | os.PathLike,
+    converters: list[Converter],
+    device: torch.device,
+) -> tuple[int, dict[str, str]]:
+    tensors = load_tensors_from_inverse_weight_map(inverse_weight_map, device)
+    for conv in converters:
+        tensors = conv.process(tensors)
+
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    save_file(tensors, save_path)
+    total_size = sum(t.nbytes for t in tensors.values())
+    weight_map = {key: os.path.basename(save_path) for key in tensors.keys()}
+    return total_size, weight_map
+
+
+def _validate_shard(
+    inverse_weight_map: InverseWeightMap,
+    save_path: str | os.PathLike,
+    converters: list[Converter],
+    device: torch.device,
+) -> None:
+    tensors = load_tensors_from_inverse_weight_map(
+        inverse_weight_map, torch.device("meta")
+    )
+    for conv in converters:
+        tensors = conv.validate(tensors)
+
+
+def _write_quant_config(
+    save_directory: str | os.PathLike,
+    converters: list[Converter],
+) -> None:
+    config = None
+    for conv in converters:
+        config = conv.update_config(config)
+
+    if config is None:
+        return
+
+    qconfig_data = config.model_dump()
+    qconfig_data = {
+        COMPRESSION_VERSION_NAME: ct_version,
+        QUANTIZATION_METHOD_NAME: "compressed-tensors",
+        TRANSFORM_CONFIG_NAME: {},
+        **qconfig_data,
+    }
+
+    config_file_path = find_config_path(save_directory)
+    if config_file_path is not None:
+        with open(config_file_path, "r") as file:
+            config_data = json.load(file)
+        config_data[QUANTIZATION_CONFIG_NAME] = qconfig_data
+        with open(config_file_path, "w") as file:
+            json.dump(config_data, file, indent=2, sort_keys=True)
+    else:
+        logger.warning(
+            f"Could not find config file in {save_directory}. Please set "
+            "quantization_config to: \n"
+            f"{json.dumps(qconfig_data, indent=2, sort_keys=True)}"
+        )

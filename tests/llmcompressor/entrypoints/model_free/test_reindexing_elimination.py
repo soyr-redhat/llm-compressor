@@ -5,15 +5,11 @@ reindex_fused_weights preprocessing step for microscale schemes.
 
 import pytest
 import torch
+from compressed_tensors.entrypoints.convert import build_inverse_weight_maps
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from safetensors.torch import save_file
 
-from llmcompressor.entrypoints.model_free.microscale import (
-    build_microscale_inverse_weight_maps,
-)
-from llmcompressor.entrypoints.model_free.process import (
-    process_file_microscale_scheme,
-)
+from llmcompressor.entrypoints.model_free.process import ModelFreePtqConverter
 
 
 def _make_nvfp4_scheme():
@@ -35,8 +31,17 @@ def _rand_weight(*shape):
     return torch.randn(*shape, dtype=torch.float16)
 
 
+@pytest.fixture
+def mfptq():
+    return ModelFreePtqConverter(
+        scheme=_make_nvfp4_scheme(),
+        scheme_name="config_group_0",
+        ignore=[],
+    )
+
+
 class TestBuildInverseWeightMaps:
-    def test_single_file(self, tmp_path):
+    def test_single_file(self, mfptq, tmp_path):
         weight_map = {
             "model.layers.0.self_attn.q_proj.weight": "shard-00001.safetensors",
             "model.layers.0.self_attn.k_proj.weight": "shard-00001.safetensors",
@@ -48,10 +53,9 @@ class TestBuildInverseWeightMaps:
         model_files = {
             "shard-00001.safetensors": str(tmp_path / "shard-00001.safetensors"),
         }
-        inverse_weight_maps = build_microscale_inverse_weight_maps(
-            weight_map, model_files, []
+        inverse_weight_maps = build_inverse_weight_maps(
+            weight_map, model_files, [mfptq]
         )
-        # result is {shard_name: {file_path: [tensor_names]}}, check tensor exists
         inverse_weight_maps["shard-00001.safetensors"][
             str(tmp_path / "shard-00001.safetensors")
         ].sort()
@@ -68,7 +72,7 @@ class TestBuildInverseWeightMaps:
             }
         }
 
-    def test_missing_dependency(self, tmp_path):
+    def test_missing_dependency(self, mfptq, tmp_path):
         weight_map = {
             "model.layers.0.self_attn.q_proj.weight": "shard-00001.safetensors",
             "model.layers.0.self_attn.k_proj.weight": "shard-00001.safetensors",
@@ -77,9 +81,9 @@ class TestBuildInverseWeightMaps:
             "shard-00001.safetensors": str(tmp_path / "shard-00001.safetensors"),
         }
         with pytest.raises(ValueError):
-            _ = build_microscale_inverse_weight_maps(weight_map, model_files, [])
+            build_inverse_weight_maps(weight_map, model_files, [mfptq])
 
-    def test_invalid_weight_map(self, tmp_path):
+    def test_invalid_weight_map(self, mfptq, tmp_path):
         weight_map = {
             "tensor.a": "shard-00001.safetensors",
             "tensor.b": "shard-00002.safetensors",
@@ -88,9 +92,9 @@ class TestBuildInverseWeightMaps:
             "shard-00001.safetensors": str(tmp_path / "shard-00001.safetensors"),
         }
         with pytest.raises(KeyError):
-            _ = build_microscale_inverse_weight_maps(weight_map, model_files, [])
+            build_inverse_weight_maps(weight_map, model_files, [mfptq])
 
-    def test_all_colocated(self, tmp_path):
+    def test_all_colocated(self, mfptq, tmp_path):
         """All fused weights in same shard — no cross-shard fetching needed."""
         weight_map = {
             "model.layers.0.self_attn.q_proj.weight": "shard-00001.safetensors",
@@ -104,8 +108,8 @@ class TestBuildInverseWeightMaps:
             "shard-00001.safetensors": str(tmp_path / "shard-00001.safetensors"),
             "shard-00002.safetensors": str(tmp_path / "shard-00002.safetensors"),
         }
-        inverse_weight_maps = build_microscale_inverse_weight_maps(
-            weight_map, model_files, []
+        inverse_weight_maps = build_inverse_weight_maps(
+            weight_map, model_files, [mfptq]
         )
         assert set(
             inverse_weight_maps["shard-00001.safetensors"][
@@ -126,7 +130,7 @@ class TestBuildInverseWeightMaps:
             "model.layers.1.self_attn.v_proj.weight",
         }
 
-    def test_cross_shard_partners_found(self, tmp_path):
+    def test_cross_shard_partners_found(self, mfptq, tmp_path):
         """q_proj on shard1, k/v on shard2 — shard1 should fetch from shard2."""
         weight_map = {
             "model.layers.0.self_attn.q_proj.weight": "shard-00001.safetensors",
@@ -140,8 +144,8 @@ class TestBuildInverseWeightMaps:
             "shard-00001.safetensors": str(tmp_path / "shard-00001.safetensors"),
             "shard-00002.safetensors": str(tmp_path / "shard-00002.safetensors"),
         }
-        inverse_weight_maps = build_microscale_inverse_weight_maps(
-            weight_map, model_files, []
+        inverse_weight_maps = build_inverse_weight_maps(
+            weight_map, model_files, [mfptq]
         )
         assert set(
             inverse_weight_maps["shard-00001.safetensors"][
@@ -175,7 +179,7 @@ class TestBuildInverseWeightMaps:
         }
 
 
-class TestProcessFileMicroscaleSchemeColocated:
+class TestModelFreePtqConverterProcessMicroscaleColocated:
     """Tests for co-located fused weights — standard case, no cross-shard needed."""
 
     @pytest.fixture
@@ -187,33 +191,18 @@ class TestProcessFileMicroscaleSchemeColocated:
             "model.layers.0.mlp.down_proj.weight": _rand_weight(32, 32),
         }
 
-    def test_colocated_fused_weights(self, qkv_tensors, tmp_path):
+    def test_colocated_fused_weights(self, mfptq, qkv_tensors):
         """Standard case: all fused weights in one shard."""
-        shard_name = "model.safetensors"
-        shard_path = tmp_path / shard_name
-        save_path = tmp_path / "out.safetensors"
-        save_file(qkv_tensors, shard_path)
-
-        # Build inverse_weight_map: just the one file with all tensors
-        inverse_weight_map = {str(shard_path): list(qkv_tensors.keys())}
-
-        total_size, weight_map = process_file_microscale_scheme(
-            inverse_weight_map=inverse_weight_map,
-            save_path=save_path,
-            scheme=_make_nvfp4_scheme(),
-            ignore=[],
-            device="cpu",
-        )
-        assert save_path.exists()
-        assert total_size > 0
-        assert len(weight_map) > 0
+        result = mfptq.process(qkv_tensors)
+        assert len(result) > 0
+        assert not any(k.endswith(".weight") and "scale" not in k for k in result)
 
 
-class TestProcessFileMicroscaleSchemeCrossShardInverseMap:
+class TestModelFreePtqConverterProcessMicroscaleCrossShardInverseMap:
     """Tests for cross-shard fused weights using precomputed inverse_weight_map."""
 
     @pytest.fixture
-    def split_shards(self, tmp_path):
+    def split_shards(self, mfptq, tmp_path):
         """q_proj on shard-1, k_proj + v_proj + down_proj on shard-2."""
         shard1_tensors = {
             "model.layers.0.self_attn.q_proj.weight": _rand_weight(32, 32),
@@ -238,9 +227,8 @@ class TestProcessFileMicroscaleSchemeCrossShardInverseMap:
             "shard-00001.safetensors": str(shard1_path),
             "shard-00002.safetensors": str(shard2_path),
         }
-        # Precompute inverse_weight_map for each shard
-        inverse_weight_maps = build_microscale_inverse_weight_maps(
-            weight_map, model_files, []
+        inverse_weight_maps = build_inverse_weight_maps(
+            weight_map, model_files, [mfptq]
         )
         return (
             shard1_path,
@@ -249,66 +237,63 @@ class TestProcessFileMicroscaleSchemeCrossShardInverseMap:
             inverse_weight_maps["shard-00002.safetensors"],
         )
 
-    def test_shard1_produces_output(self, split_shards, tmp_path):
+    def test_shard1_produces_output(self, mfptq, split_shards, tmp_path):
         """Shard-1 (q_proj only) processes correctly using precomputed inverse map."""
+        from compressed_tensors.utils.safetensors_load import (
+            load_tensors_from_inverse_weight_map,
+        )
+
         shard1_path, _, iwm1, _ = split_shards
         save_path = tmp_path / "out-00001.safetensors"
 
-        total_size, weight_map = process_file_microscale_scheme(
-            inverse_weight_map=iwm1,
-            save_path=save_path,
-            scheme=_make_nvfp4_scheme(),
-            ignore=[],
-            device="cpu",
-        )
-        assert save_path.exists()
-        assert total_size > 0
-        assert len(weight_map) > 0
+        tensors = load_tensors_from_inverse_weight_map(iwm1, "cpu")
+        result = mfptq.process(tensors)
 
-    def test_shard2_produces_output(self, split_shards, tmp_path):
+        from safetensors.torch import save_file as sf
+
+        sf(result, save_path)
+        assert save_path.exists()
+        assert len(result) > 0
+
+    def test_shard2_produces_output(self, mfptq, split_shards, tmp_path):
         """Shard-2 (k/v/down) processes correctly using precomputed inverse map."""
+        from compressed_tensors.utils.safetensors_load import (
+            load_tensors_from_inverse_weight_map,
+        )
+
         _, shard2_path, _, iwm2 = split_shards
         save_path = tmp_path / "out-00002.safetensors"
 
-        total_size, weight_map = process_file_microscale_scheme(
-            inverse_weight_map=iwm2,
-            save_path=save_path,
-            scheme=_make_nvfp4_scheme(),
-            ignore=[],
-            device="cpu",
-        )
-        assert save_path.exists()
-        assert total_size > 0
+        tensors = load_tensors_from_inverse_weight_map(iwm2, "cpu")
+        result = mfptq.process(tensors)
 
-    def test_both_shards_produce_same_keys_as_merged(self, split_shards, tmp_path):
-        """Combined output keys from both shards
-        should match merged single-shard keys."""
+        from safetensors.torch import save_file as sf
+
+        sf(result, save_path)
+        assert save_path.exists()
+        assert len(result) > 0
+
+    def test_both_shards_produce_same_keys_as_merged(
+        self, mfptq, split_shards, tmp_path
+    ):
+        """Combined output keys from both shards should match merged single-shard keys."""
+        from safetensors.torch import load_file
+        from compressed_tensors.utils.safetensors_load import (
+            load_tensors_from_inverse_weight_map,
+        )
+
         shard1_path, shard2_path, iwm1, iwm2 = split_shards
 
-        out1 = tmp_path / "out-00001.safetensors"
-        out2 = tmp_path / "out-00002.safetensors"
-        _, wm1 = process_file_microscale_scheme(
-            iwm1, out1, _make_nvfp4_scheme(), [], "cpu"
-        )
-        _, wm2 = process_file_microscale_scheme(
-            iwm2, out2, _make_nvfp4_scheme(), [], "cpu"
-        )
-        combined_keys = set(wm1.keys()) | set(wm2.keys())
+        result1 = mfptq.process(load_tensors_from_inverse_weight_map(iwm1, "cpu"))
+        result2 = mfptq.process(load_tensors_from_inverse_weight_map(iwm2, "cpu"))
+        combined_keys = set(result1.keys()) | set(result2.keys())
 
         # Process merged shard as reference
-        from safetensors.torch import load_file
-
         merged = {**load_file(shard1_path), **load_file(shard2_path)}
-        merged_path = tmp_path / "merged.safetensors"
-        merged_out = tmp_path / "merged_out.safetensors"
-        save_file(merged, merged_path)
-        merged_iwm = {str(merged_path): list(merged.keys())}
-        _, wm_merged = process_file_microscale_scheme(
-            merged_iwm, merged_out, _make_nvfp4_scheme(), [], "cpu"
-        )
+        result_merged = mfptq.process(merged)
 
-        assert combined_keys == set(wm_merged.keys()), (
+        assert combined_keys == set(result_merged.keys()), (
             f"Key mismatch:\n"
-            f"  split only: {sorted(combined_keys - set(wm_merged.keys()))}\n"
-            f"  merged only: {sorted(set(wm_merged.keys()) - combined_keys)}"
+            f"  split only: {sorted(combined_keys - set(result_merged.keys()))}\n"
+            f"  merged only: {sorted(set(result_merged.keys()) - combined_keys)}"
         )
